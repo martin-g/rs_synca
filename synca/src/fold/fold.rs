@@ -8,6 +8,8 @@ use syn::{
 
 use crate::SyncAFoldAttributes;
 
+const GLOB_IDENTIFIER: &'static str = "__synca_glob_identifier";
+
 #[derive(Debug, PartialEq)]
 pub struct SyncAFold {
   pub module_name: String,
@@ -92,6 +94,20 @@ impl Fold for SyncAFold {
             flatten_use_path(item, prefix.clone(), out);
           }
         }
+        syn::UseTree::Glob(_use_glob) => {
+          let mut new_prefix = prefix.clone();
+          new_prefix.push(syn::PathSegment {
+            ident: syn::Ident::new(GLOB_IDENTIFIER, proc_macro2::Span::call_site()),
+            arguments: syn::PathArguments::None,
+          });
+          out.push(syn::Type::Path(syn::TypePath {
+            qself: None,
+            path: syn::Path {
+              leading_colon: None,
+              segments: new_prefix.into_iter().collect(),
+            },
+          }));
+        }
         _ => {}
       }
     }
@@ -158,7 +174,13 @@ impl Fold for SyncAFold {
     fn trie_to_use_tree(node: &TrieNode) -> syn::UseTree {
       if node.is_leaf() {
         let ident = syn::Ident::new(&node.name, proc_macro2::Span::call_site());
-        syn::UseTree::Name(syn::UseName { ident })
+        if &node.name == GLOB_IDENTIFIER {
+          syn::UseTree::Glob(syn::UseGlob {
+            star_token: Default::default(),
+          })
+        } else {
+          syn::UseTree::Name(syn::UseName { ident })
+        }
       } else if node.children.len() == 1 {
         // single child, add a path for it
         let ident = syn::Ident::new(&node.name, proc_macro2::Span::call_site());
@@ -194,12 +216,12 @@ impl Fold for SyncAFold {
       }) => match *tree {
         UseTree::Path(new_use_path) => fold::fold_use_path(self, new_use_path),
         _ => {
-          eprintln!("Unexpected UseTree: {tree:?}");
+          eprintln!("Unexpected inner tree: {tree:?}");
           fold::fold_use_path(self, use_path)
         }
       },
       _ => {
-        eprintln!("Unexpected UseTree: {rebuilt_tree:?}");
+        eprintln!("Unexpected rebuilt tree: {rebuilt_tree:?} with orig: {use_path:?}");
         fold::fold_use_path(self, use_path)
       }
     }
@@ -429,9 +451,15 @@ mod tests {
     assert_as_str!(
       fold_item_fn,
       syn::ItemFn,
-      parse_quote!(fn my_fn() {}),
-      parse_quote!(fn my_fn() {}),
-      parse_quote!(fn my_fn() {})
+      parse_quote!(
+        fn my_fn() {}
+      ),
+      parse_quote!(
+        fn my_fn() {}
+      ),
+      parse_quote!(
+        fn my_fn() {}
+      )
     );
 
     assert_as_str!(
@@ -439,7 +467,7 @@ mod tests {
       syn::ItemFn,
       parse_quote!(
         /// # FN get_name
-        /// 
+        ///
         /// Args
         /// - [synca::match]tokio_postgres::Client|postgres::Client[/synca::match]
         async fn get_name(client: &mut tokio_postgres::Client) -> String {
@@ -449,7 +477,7 @@ mod tests {
         }
       ),
       parse_quote!(
-        #[doc = " # FN get_name\n \n Args\n - tokio_postgres::Client"]
+        #[doc = " # FN get_name\n\n Args\n - tokio_postgres::Client"]
         async fn get_name(client: &mut tokio_postgres::Client) -> String {
           let row = client.query_one(r#"SELECT 'My name' "name""#, &[]).await?;
 
@@ -457,7 +485,7 @@ mod tests {
         }
       ),
       parse_quote!(
-        #[doc = " # FN get_name\n \n Args\n - postgres::Client"]
+        #[doc = " # FN get_name\n\n Args\n - postgres::Client"]
         fn get_name(client: &mut postgres::Client) -> String {
           let row = client.query_one(r#"SELECT 'My name' "name""#, &[])?;
 
@@ -474,7 +502,7 @@ mod tests {
       syn::ItemMod,
       parse_quote!(
         /// # my_mod
-        /// 
+        ///
         /// - [synca::match]tokio_postgres::Client|postgres::Client[/synca::match]
         mod my_mod {
           type Client = tokio_postgres::Client;
@@ -483,7 +511,7 @@ mod tests {
         }
       ),
       parse_quote!(
-        #[doc = " # my_mod\n \n - tokio_postgres::Client"]
+        #[doc = " # my_mod\n\n - tokio_postgres::Client"]
         mod my_mod {
           type Client = tokio_postgres::Client;
 
@@ -491,7 +519,7 @@ mod tests {
         }
       ),
       parse_quote!(
-        #[doc = " # my_mod\n \n - postgres::Client"]
+        #[doc = " # my_mod\n\n - postgres::Client"]
         mod my_mod {
           type Client = postgres::Client;
 
@@ -508,7 +536,7 @@ mod tests {
       syn::ItemMod,
       parse_quote!(
         /// # my_mod
-        /// 
+        ///
         /// - [synca::match]tokio_postgres::Client|postgres::Client[/synca::match]
         mod my_mod {
           type Client = tokio_postgres::Client;
@@ -522,7 +550,7 @@ mod tests {
         }
       ),
       parse_quote!(
-        #[doc = " # my_mod\n \n - tokio_postgres::Client"]
+        #[doc = " # my_mod\n\n - tokio_postgres::Client"]
         mod my_mod {
           type Client = tokio_postgres::Client;
 
@@ -534,7 +562,7 @@ mod tests {
         }
       ),
       parse_quote!(
-        #[doc = " # my_mod\n \n - postgres::Client"]
+        #[doc = " # my_mod\n\n - postgres::Client"]
         mod my_mod {
           type Client = postgres::Client;
 
