@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use quote::ToTokens;
-use syn::{fold::{self, Fold}, Expr};
+use syn::{
+  fold::{self, Fold},
+  Expr, UsePath, UseTree,
+};
 
 use crate::SyncAFoldAttributes;
 
@@ -11,14 +14,14 @@ pub struct SyncAFold {
   pub is_async: bool,
   pub types: HashMap<syn::Type, syn::Type>,
   pub attributes: HashMap<syn::Attribute, syn::Attribute>,
-  pub cfg: Expr
+  pub cfg: Expr,
 }
 
 macro_rules! impl_fold_fn {
   ($fn_name: ident, $ty: ty) => {
     fn $fn_name(&mut self, i: $ty) -> $ty {
       let attrs = SyncAFoldAttributes::new(&self, &i.attrs);
-      if attrs.ignored { 
+      if attrs.ignored {
         return i;
       }
 
@@ -37,30 +40,180 @@ macro_rules! impl_fold_attrs {
   ($fn_name: ident, $ty: ty) => {
     fn $fn_name(&mut self, i: $ty) -> $ty {
       let attrs = SyncAFoldAttributes::new(&self, &i.attrs);
-      if attrs.ignored { 
+      if attrs.ignored {
         return i;
       }
-      
+
       let mut new_i = i.clone();
       new_i.attrs = attrs.new_attrs;
-      
+
       fold::$fn_name(self, new_i)
     }
   };
 }
 
 impl Fold for SyncAFold {
+  fn fold_use_path(&mut self, use_path: UsePath) -> UsePath {
+    if self.is_async {
+      return fold::fold_use_path(self, use_path);
+    }
+
+    // Step 1: Flatten use_path into Vec<syn::Type::Path>
+    fn flatten_use_path(
+      use_tree: &syn::UseTree,
+      prefix: Vec<syn::PathSegment>,
+      out: &mut Vec<syn::Type>,
+    ) {
+      match use_tree {
+        syn::UseTree::Path(use_path) => {
+          let mut new_prefix = prefix.clone();
+          new_prefix.push(syn::PathSegment {
+            ident: use_path.ident.clone(),
+            arguments: syn::PathArguments::None,
+          });
+          flatten_use_path(&use_path.tree, new_prefix, out);
+        }
+        syn::UseTree::Name(use_name) => {
+          let mut new_prefix = prefix.clone();
+          new_prefix.push(syn::PathSegment {
+            ident: use_name.ident.clone(),
+            arguments: syn::PathArguments::None,
+          });
+          out.push(syn::Type::Path(syn::TypePath {
+            qself: None,
+            path: syn::Path {
+              leading_colon: None,
+              segments: new_prefix.into_iter().collect(),
+            },
+          }));
+        }
+        syn::UseTree::Group(use_group) => {
+          for item in &use_group.items {
+            flatten_use_path(item, prefix.clone(), out);
+          }
+        }
+        _ => {}
+      }
+    }
+
+    let mut flat_paths = Vec::new();
+    flatten_use_path(
+      &use_path.tree,
+      vec![syn::PathSegment {
+        ident: use_path.ident.clone(),
+        arguments: syn::PathArguments::None,
+      }],
+      &mut flat_paths,
+    );
+
+    // Step 2: Build a prefix tree (trie) from the flat paths
+    #[derive(Debug, Default)]
+    struct TrieNode {
+      name: String,
+      children: Vec<TrieNode>,
+    }
+
+    impl TrieNode {
+      fn is_leaf(&self) -> bool {
+        self.children.is_empty()
+      }
+    }
+
+    fn insert_path(node: &mut TrieNode, segments: &[syn::PathSegment]) {
+      if segments.is_empty() {
+        return;
+      }
+      let ident = segments[0].ident.to_string();
+      if let Some(mut child) = node.children.iter_mut().find(|child| child.name == ident) {
+        insert_path(&mut child, &segments[1..])
+      } else {
+        let mut new_child = TrieNode {
+          name: ident.clone(),
+          children: vec![],
+        };
+        insert_path(&mut new_child, &segments[1..]);
+        node.children.push(new_child);
+      }
+    }
+
+    let mut root = TrieNode {
+      name: "__root__".to_string(),
+      ..Default::default()
+    };
+
+    for path in &flat_paths {
+      let path = self.types.get(path).unwrap_or(path);
+      match path {
+        syn::Type::Path(tp) => {
+          let segments: Vec<_> = tp.path.segments.iter().cloned().collect();
+          insert_path(&mut root, &segments);
+        }
+        _ => {
+          panic!("Expected a Type::Path, got: {:?}", path)
+        }
+      }
+    }
+
+    // Step 3: Recursively convert the trie to UseTree
+    fn trie_to_use_tree(node: &TrieNode) -> syn::UseTree {
+      if node.is_leaf() {
+        let ident = syn::Ident::new(&node.name, proc_macro2::Span::call_site());
+        syn::UseTree::Name(syn::UseName { ident })
+      } else if node.children.len() == 1 {
+        // single child, add a path for it
+        let ident = syn::Ident::new(&node.name, proc_macro2::Span::call_site());
+        syn::UseTree::Path(syn::UsePath {
+          ident,
+          colon2_token: Default::default(),
+          tree: Box::new(trie_to_use_tree(&node.children[0])),
+        })
+      } else {
+        // Multiple children, group them
+        let items = node.children.iter().map(trie_to_use_tree).collect();
+        let group = syn::UseTree::Group(syn::UseGroup {
+          brace_token: Default::default(),
+          items,
+        });
+        let ident = syn::Ident::new(&node.name, proc_macro2::Span::call_site());
+        syn::UseTree::Path(syn::UsePath {
+          ident,
+          colon2_token: Default::default(),
+          tree: Box::new(group),
+        })
+      }
+    }
+
+    // The root ident and colon2_token come from the original use_path
+    let rebuilt_tree = trie_to_use_tree(&root);
+
+    match rebuilt_tree {
+      UseTree::Path(UsePath {
+        ident: _,
+        colon2_token: _,
+        tree,
+      }) => match *tree {
+        UseTree::Path(new_use_path) => fold::fold_use_path(self, new_use_path),
+        _ => {
+          eprintln!("Unexpected UseTree: {tree:?}");
+          fold::fold_use_path(self, use_path)
+        }
+      },
+      _ => {
+        eprintln!("Unexpected UseTree: {rebuilt_tree:?}");
+        fold::fold_use_path(self, use_path)
+      }
+    }
+  }
+
   fn fold_type(&mut self, ty: syn::Type) -> syn::Type {
     if self.is_async {
       return fold::fold_type(self, ty);
     }
 
     match &ty {
-      syn::Type::Path(path) => {
-        match self.types.get(&ty) {
-          Some(new_ty) => new_ty.clone(),
-          None => fold::fold_type(self, syn::Type::Path(path.clone())),
-        }
+      syn::Type::Path(path) => match self.types.get(&ty) {
+        Some(new_ty) => new_ty.clone(),
+        None => fold::fold_type(self, syn::Type::Path(path.clone())),
       },
       _ => fold::fold_type(self, ty),
     }
@@ -76,7 +229,7 @@ impl Fold for SyncAFold {
       .to_string()
       .replace(". await", "")
       .replace(".await", "");
-      
+
     syn::parse_str(&macro_str).unwrap()
   }
 
@@ -100,7 +253,7 @@ impl Fold for SyncAFold {
   impl_fold_fn!(fold_impl_item_fn, syn::ImplItemFn);
   impl_fold_fn!(fold_trait_item_fn, syn::TraitItemFn);
   impl_fold_fn!(fold_foreign_item_fn, syn::ForeignItemFn);
-  
+
   impl_fold_attrs!(fold_arm, syn::Arm);
   impl_fold_attrs!(fold_bare_fn_arg, syn::BareFnArg);
   impl_fold_attrs!(fold_bare_variadic, syn::BareVariadic);
@@ -198,19 +351,19 @@ mod tests {
   use syn::{fold::Fold, parse_quote};
 
   use crate::SyncAFold;
-  
+
   macro_rules! assert_as_str {
     (
-      $fn_name: ident, 
-      $ty: ty, 
-      $a: expr, 
-      $b_async: expr, 
+      $fn_name: ident,
+      $ty: ty,
+      $a: expr,
+      $b_async: expr,
       $b_sync: expr
     ) => {
       let (mut fold_async, mut fold_sync) = synca_fold();
       let b_async_typed: $ty = $b_async;
       let b_sync_typed: $ty = $b_sync;
-      
+
       assert_eq!(
         fold_async.$fn_name($a).to_token_stream().to_string(),
         b_async_typed.to_token_stream().to_string()
@@ -219,13 +372,13 @@ mod tests {
         fold_sync.$fn_name($a).to_token_stream().to_string(),
         b_sync_typed.to_token_stream().to_string()
       );
-    }
+    };
   }
 
   #[test]
   fn fold_type() {
     assert_as_str!(
-      fold_type, 
+      fold_type,
       syn::Type,
       parse_quote!(std::collections::HashMap),
       parse_quote!(std::collections::HashMap),
@@ -233,7 +386,7 @@ mod tests {
     );
 
     assert_as_str!(
-      fold_type, 
+      fold_type,
       syn::Type,
       parse_quote!(tokio_postgres::Client),
       parse_quote!(tokio_postgres::Client),
@@ -241,7 +394,7 @@ mod tests {
     );
 
     assert_as_str!(
-      fold_type, 
+      fold_type,
       syn::Type,
       parse_quote!(&mut tokio_postgres::Client),
       parse_quote!(&mut tokio_postgres::Client),
@@ -252,7 +405,7 @@ mod tests {
   #[test]
   fn fold_macro() {
     assert_as_str!(
-      fold_macro, 
+      fold_macro,
       syn::Macro,
       parse_quote!(assert_eq!(dao.answer().await, 42)),
       parse_quote!(assert_eq!(dao.answer().await, 42)),
@@ -263,7 +416,7 @@ mod tests {
   #[test]
   fn fold_expr() {
     assert_as_str!(
-      fold_expr, 
+      fold_expr,
       syn::Expr,
       parse_quote!(dao.answer().await?.id),
       parse_quote!(dao.answer().await?.id),
@@ -274,22 +427,22 @@ mod tests {
   #[test]
   fn macro_impl_fold_fn() {
     assert_as_str!(
-      fold_item_fn, 
+      fold_item_fn,
       syn::ItemFn,
-      parse_quote!(fn my_fn() { }),
-      parse_quote!(fn my_fn() { }),
-      parse_quote!(fn my_fn() { })
+      parse_quote!(fn my_fn() {}),
+      parse_quote!(fn my_fn() {}),
+      parse_quote!(fn my_fn() {})
     );
 
     assert_as_str!(
-      fold_item_fn, 
+      fold_item_fn,
       syn::ItemFn,
       parse_quote!(
         /// # FN get_name
         /// 
         /// Args
         /// - [synca::match]tokio_postgres::Client|postgres::Client[/synca::match]
-        async fn get_name(client: &mut tokio_postgres::Client) -> String { 
+        async fn get_name(client: &mut tokio_postgres::Client) -> String {
           let row = client.query_one(r#"SELECT 'My name' "name""#, &[]).await?;
 
           row.get("name")
@@ -297,7 +450,7 @@ mod tests {
       ),
       parse_quote!(
         #[doc = " # FN get_name\n \n Args\n - tokio_postgres::Client"]
-        async fn get_name(client: &mut tokio_postgres::Client) -> String { 
+        async fn get_name(client: &mut tokio_postgres::Client) -> String {
           let row = client.query_one(r#"SELECT 'My name' "name""#, &[]).await?;
 
           row.get("name")
@@ -305,7 +458,7 @@ mod tests {
       ),
       parse_quote!(
         #[doc = " # FN get_name\n \n Args\n - postgres::Client"]
-        fn get_name(client: &mut postgres::Client) -> String { 
+        fn get_name(client: &mut postgres::Client) -> String {
           let row = client.query_one(r#"SELECT 'My name' "name""#, &[])?;
 
           row.get("name")
@@ -317,7 +470,7 @@ mod tests {
   #[test]
   fn macro_impl_fold_attrs() {
     assert_as_str!(
-      fold_item_mod, 
+      fold_item_mod,
       syn::ItemMod,
       parse_quote!(
         /// # my_mod
@@ -325,30 +478,24 @@ mod tests {
         /// - [synca::match]tokio_postgres::Client|postgres::Client[/synca::match]
         mod my_mod {
           type Client = tokio_postgres::Client;
-          
-          async fn name() {
 
-          }
+          async fn name() {}
         }
       ),
       parse_quote!(
         #[doc = " # my_mod\n \n - tokio_postgres::Client"]
         mod my_mod {
           type Client = tokio_postgres::Client;
-          
-          async fn name() {
 
-          }
+          async fn name() {}
         }
       ),
       parse_quote!(
         #[doc = " # my_mod\n \n - postgres::Client"]
         mod my_mod {
           type Client = postgres::Client;
-          
-          fn name() {
 
-          }
+          fn name() {}
         }
       )
     );
@@ -357,7 +504,7 @@ mod tests {
   #[test]
   fn synca_only() {
     assert_as_str!(
-      fold_item_mod, 
+      fold_item_mod,
       syn::ItemMod,
       parse_quote!(
         /// # my_mod
@@ -365,7 +512,7 @@ mod tests {
         /// - [synca::match]tokio_postgres::Client|postgres::Client[/synca::match]
         mod my_mod {
           type Client = tokio_postgres::Client;
-          
+
           async fn name() -> String {
             #[synca::cfg(tokio)]
             return "tokio_42".into();
@@ -378,7 +525,7 @@ mod tests {
         #[doc = " # my_mod\n \n - tokio_postgres::Client"]
         mod my_mod {
           type Client = tokio_postgres::Client;
-          
+
           async fn name() -> String {
             return "tokio_42".into();
             #[cfg(all(feature = "tokio", not(feature = "tokio")))]
@@ -390,7 +537,7 @@ mod tests {
         #[doc = " # my_mod\n \n - postgres::Client"]
         mod my_mod {
           type Client = postgres::Client;
-          
+
           fn name() -> String {
             #[cfg(all(feature = "sync", not(feature = "sync")))]
             return "tokio_42".into();
@@ -403,28 +550,33 @@ mod tests {
 
   fn synca_fold() -> (SyncAFold, SyncAFold) {
     let types: HashMap<syn::Type, syn::Type> = HashMap::from([
-      (parse_quote!(tokio_postgres::Client), parse_quote!(postgres::Client)),
-      (parse_quote!(tokio_postgres::NoTls), parse_quote!(postgres::NoTls)),
+      (
+        parse_quote!(tokio_postgres::Client),
+        parse_quote!(postgres::Client),
+      ),
+      (
+        parse_quote!(tokio_postgres::NoTls),
+        parse_quote!(postgres::NoTls),
+      ),
     ]);
-    let attributes: HashMap<syn::Attribute, syn::Attribute> = HashMap::from([
-      (parse_quote!(#[tokio::test]), parse_quote!(#[test])),
-    ]);
-    
+    let attributes: HashMap<syn::Attribute, syn::Attribute> =
+      HashMap::from([(parse_quote!(#[tokio::test]), parse_quote!(#[test]))]);
+
     (
       SyncAFold {
         module_name: "tokio".into(),
         is_async: true,
         types: types.clone(),
         attributes: attributes.clone(),
-        cfg: parse_quote!(feature = "tokio")
+        cfg: parse_quote!(feature = "tokio"),
       },
       SyncAFold {
         module_name: "sync".into(),
         is_async: false,
         types,
         attributes,
-        cfg: parse_quote!(feature = "sync")
-      }
+        cfg: parse_quote!(feature = "sync"),
+      },
     )
   }
 }
