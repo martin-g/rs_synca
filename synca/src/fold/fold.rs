@@ -108,7 +108,20 @@ impl Fold for SyncAFold {
             },
           }));
         }
-        _ => {}
+        syn::UseTree::Rename(use_rename) => {
+          let mut new_prefix = prefix.clone();
+          new_prefix.push(syn::PathSegment {
+            ident: use_rename.rename.clone(),
+            arguments: syn::PathArguments::None,
+          });
+          out.push(syn::Type::Path(syn::TypePath {
+            qself: None,
+            path: syn::Path {
+              leading_colon: None,
+              segments: new_prefix.into_iter().collect(),
+            },
+          }));
+        }
       }
     }
 
