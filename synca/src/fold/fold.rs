@@ -54,7 +54,7 @@ macro_rules! impl_fold_attrs {
 
 impl Fold for SyncAFold {
   fn fold_use_path(&mut self, use_path: UsePath) -> UsePath {
-    if self.is_async {
+    if self.is_async || self.types.is_empty() {
       return fold::fold_use_path(self, use_path);
     }
 

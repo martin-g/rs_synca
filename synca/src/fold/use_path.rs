@@ -20,8 +20,8 @@ impl SyncAFold {
     };
 
     // Step 2: Replace
-    for path in &flat_paths {
-      let path = self.types.get(path).unwrap_or(path);
+    for flat_path in &flat_paths {
+      let path = self.maybe_replace(flat_path);
       match path {
         syn::Type::Path(tp) => {
           let segments: Vec<_> = tp.path.segments.iter().cloned().collect();
@@ -36,6 +36,38 @@ impl SyncAFold {
     // Step 3: Recursively convert the trie to UseTree
     let use_tree = trie_to_use_tree(&root);
     use_tree
+  }
+
+  fn maybe_replace(&self, path: &syn::Type) -> syn::Type {
+    // Only operate on Type::Path
+    if let syn::Type::Path(type_path) = path {
+      let segments: Vec<_> = type_path.path.segments.iter().cloned().collect();
+
+      for (from, to) in self.types.iter() {
+        if let syn::Type::Path(from_type_path) = from {
+          let from_segments: Vec<_> = from_type_path.path.segments.iter().cloned().collect();
+          if segments.starts_with(&from_segments) {
+            if let syn::Type::Path(to_type_path) = to {
+              let to_segments: Vec<_> = to_type_path.path.segments.iter().cloned().collect();
+              let mut new_segments = to_segments.clone();
+              new_segments.extend_from_slice(&segments[from_segments.len()..]);
+              let path = syn::Path {
+                leading_colon: type_path.path.leading_colon,
+                segments: new_segments.into_iter().collect(),
+              };
+              return syn::Type::Path(syn::TypePath {
+                qself: type_path.qself.clone(),
+                path,
+              });
+            }
+          }
+        }
+      }
+      // No match, return original
+      path.clone()
+    } else {
+      path.clone()
+    }
   }
 }
 
