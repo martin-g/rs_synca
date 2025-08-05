@@ -113,7 +113,27 @@ impl Fold for SyncAFold {
     }
 
     match exp {
-      Expr::Await(e) => self.fold_expr(*e.base),
+      Expr::Await(e) => match *e.base {
+        Expr::Call(ref call) => match *call.func {
+          Expr::Path(ref path) => {
+            let segments = &path.path.segments;
+            if segments.len() >= 2 {
+              let segs: Vec<_> = segments.iter().cloned().collect();
+
+              if segs[0].ident.to_string() == "Box" && segs[1].ident.to_string() == "pin" {
+                let new_call = call.args.first().unwrap().clone();
+                self.fold_expr(new_call)
+              } else {
+                self.fold_expr(*e.base)
+              }
+            } else {
+              self.fold_expr(*e.base)
+            }
+          }
+          _ => self.fold_expr(*e.base),
+        },
+        _ => self.fold_expr(*e.base),
+      },
       Expr::Async(e) => self.fold_expr(Expr::Block(syn::ExprBlock {
         attrs: e.attrs,
         label: None,
