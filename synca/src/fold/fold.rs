@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
+use crate::SyncAFoldAttributes;
 use quote::ToTokens;
 use syn::{
   fold::{self, Fold},
-  Expr, UsePath, UseTree,
+  Expr,
 };
-
-use crate::SyncAFoldAttributes;
+#[cfg(feature = "usepath")]
+use syn::{UsePath, UseTree};
 
 #[derive(Debug, PartialEq)]
 pub struct SyncAFold {
@@ -53,6 +54,7 @@ macro_rules! impl_fold_attrs {
 }
 
 impl Fold for SyncAFold {
+  #[cfg(feature = "usepath")]
   fn fold_use_path(&mut self, use_path: UsePath) -> UsePath {
     if self.is_async || self.types.is_empty() {
       return fold::fold_use_path(self, use_path);
@@ -113,6 +115,7 @@ impl Fold for SyncAFold {
     }
 
     match exp {
+      #[cfg(feature = "boxpin")]
       Expr::Await(e) => match *e.base {
         Expr::Call(ref call) => match *call.func {
           Expr::Path(ref path) => {
@@ -134,6 +137,8 @@ impl Fold for SyncAFold {
         },
         _ => self.fold_expr(*e.base),
       },
+      #[cfg(not(feature = "boxpin"))]
+      Expr::Await(e) => self.fold_expr(*e.base),
       Expr::Async(e) => self.fold_expr(Expr::Block(syn::ExprBlock {
         attrs: e.attrs,
         label: None,
